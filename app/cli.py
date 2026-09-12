@@ -19,6 +19,7 @@ from rich.table import Table
 from app.backtest.basket import DEFAULT_BASKET, BasketResult, run_basket
 from app.backtest.data import load_historical
 from app.backtest.engine import BacktestEngine
+from app.backtest.research import ResearchResult, run_research
 from app.config import settings
 from app.db.session import SessionLocal, init_db
 
@@ -340,6 +341,92 @@ def _save_basket_report(start: str, end: str, result: BasketResult) -> None:
             }
             for o in result.outcomes
         ],
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+    console.print(f"\nFull report saved to [bold]{out_path}[/bold]")
+
+
+@app.command("research")
+def research() -> None:
+    """Three-way (TRAIN/VALIDATION/HOLDOUT) walk-forward comparison of a
+    small set of alternative strategies against the unchanged baseline —
+    see app/backtest/research.py for the full protocol. HOLDOUT (2024) is
+    only ever touched for the single variant selected from VALIDATION
+    performance, and only if one clears it."""
+    init_db()
+    console.print("Screening symbol universe on TRAIN (2019-01-01 to 2021-12-31) and running TRAIN/VALIDATION for every variant ...\n")
+    session = SessionLocal()
+    try:
+        result = run_research(session, settings)
+    finally:
+        session.close()
+
+    _print_research_report(result)
+    _save_research_report(result)
+
+
+def _print_research_report(result: ResearchResult) -> None:
+    console.print(
+        f"Tradeable symbol universe (screened on TRAIN only): {len(result.tradeable_symbols)} symbols\n"
+    )
+
+    table = Table(title="TRAIN vs. VALIDATION — every variant tried, no cherry-picking")
+    table.add_column("Variant")
+    table.add_column("Window")
+    table.add_column("Trades", justify="right")
+    table.add_column("Win rate %", justify="right")
+    table.add_column("Profit factor", justify="right")
+    table.add_column("Expectancy (Rs)", justify="right")
+    table.add_column("Expectancy (R)", justify="right")
+    table.add_column("Passes rule?", justify="center")
+
+    for name in result.train_metrics:
+        tm = result.train_metrics[name]
+        vm = result.validation_metrics[name]
+        passed = result.validation_pass[name]
+        table.add_row(
+            name, "TRAIN", str(tm["num_trades"]), str(tm["win_rate_pct"]), str(tm["profit_factor"]),
+            str(tm["expectancy_inr"]), str(tm["expectancy_r"]), "",
+        )
+        table.add_row(
+            "", "VALIDATION", str(vm["num_trades"]), str(vm["win_rate_pct"]), str(vm["profit_factor"]),
+            str(vm["expectancy_inr"]), str(vm["expectancy_r"]),
+            "[green]YES[/green]" if passed else "[red]no[/red]",
+        )
+    console.print(table)
+
+    console.print(f"\n{result.selection_reason}\n")
+
+    if result.holdout_metrics is not None:
+        ho = result.holdout_metrics
+        holdout_table = Table(title=f"HOLDOUT (2024, one shot) — '{result.selected_variant}' only")
+        holdout_table.add_column("Trades", justify="right")
+        holdout_table.add_column("Win rate %", justify="right")
+        holdout_table.add_column("Profit factor", justify="right")
+        holdout_table.add_column("Expectancy (Rs)", justify="right")
+        holdout_table.add_column("Expectancy (R)", justify="right")
+        holdout_table.add_row(
+            str(ho["num_trades"]), str(ho["win_rate_pct"]), str(ho["profit_factor"]),
+            str(ho["expectancy_inr"]), str(ho["expectancy_r"]),
+        )
+        console.print(holdout_table)
+
+    console.print()
+    console.print(f"[bold]{result.verdict}[/bold]")
+
+
+def _save_research_report(result: ResearchResult) -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = REPORTS_DIR / "research_walkforward.json"
+    payload = {
+        "tradeable_symbols": result.tradeable_symbols,
+        "train_metrics": result.train_metrics,
+        "validation_metrics": result.validation_metrics,
+        "validation_pass": result.validation_pass,
+        "selected_variant": result.selected_variant,
+        "selection_reason": result.selection_reason,
+        "holdout_metrics": result.holdout_metrics,
+        "verdict": result.verdict,
     }
     out_path.write_text(json.dumps(payload, indent=2))
     console.print(f"\nFull report saved to [bold]{out_path}[/bold]")

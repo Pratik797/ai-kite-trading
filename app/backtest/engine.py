@@ -40,6 +40,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from dataclasses import dataclass, field
+from typing import Callable
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -51,7 +52,10 @@ from app.db.models import BacktestRun, SignalDirection, Trade, TradeStatus
 from app.features.indicators import add_all_features
 from app.risk.engine import OpenPosition, RiskEngine, RiskState
 from app.risk.profit_locker import ProfitLocker
-from app.strategy.baseline import generate_signal
+from app.strategy.baseline import generate_signal as _baseline_generate_signal
+from app.strategy.signals import TradeSignal
+
+SignalFn = Callable[[pd.DataFrame, str, int], TradeSignal]
 
 
 @dataclass
@@ -83,7 +87,13 @@ class BacktestEngine:
         *,
         out_of_sample_fraction: float = 0.3,
         strategy_name: str = "baseline_ema_rsi_atr",
+        signal_fn: SignalFn = _baseline_generate_signal,
     ) -> BacktestResult:
+        """`signal_fn` defaults to the baseline EMA-crossover strategy but
+        accepts any callable with the same (df, symbol, as_of_index) ->
+        TradeSignal contract (see app.strategy.variants), so alternative
+        strategies can be backtested through the exact same replay/risk/
+        cost/profit-locker machinery without duplicating it."""
         featured = add_all_features(df)
         if len(featured) < 60:
             raise ValueError("need at least ~60 bars for indicators to warm up and produce a meaningful backtest")
@@ -173,7 +183,7 @@ class BacktestEngine:
 
             # --- 2. Generate a signal as-of this bar (no lookahead) and risk-check it ---
             if i + 1 < len(featured):
-                signal = generate_signal(featured, symbol, i)
+                signal = signal_fn(featured, symbol, i)
                 if signal.is_actionable:
                     state = RiskState(
                         active_trading_capital_inr=profit_locker.active_trading_capital_inr,

@@ -46,13 +46,21 @@ see the honest results below.
 - **Basket backtest** (`app/backtest/basket.py`) — screens and backtests a
   whole basket of symbols at once and pools the results, so a finding isn't
   a one-symbol fluke (see results below).
+- **Strategy variants** (`app/strategy/variants.py`) — a mean-reversion and
+  a regime-gated-trend alternative, each testing a distinct hypothesis
+  against the baseline (see the walk-forward results below).
+- **Walk-forward research** (`app/backtest/research.py`) — a strict
+  TRAIN/VALIDATION/HOLDOUT comparison across strategy variants, built so
+  trying multiple variants can't fool us into an overfit "edge".
 - **CLI** (`app/cli.py`) — `backtest` for one symbol, `basket-backtest` for
-  a whole basket; both print and save a report.
-- **Tests** (`tests/`) — 56 tests covering indicators, the baseline
+  a whole basket, `research` for the three-way variant comparison; all
+  print and save a report.
+- **Tests** (`tests/`) — 71 tests covering indicators, the baseline
   strategy (including a dedicated no-lookahead check), every risk-engine
   rejection rule and its position-sizing math, the profit locker, the cost
   model, the metrics calculations, the screener, the buy-and-hold
-  benchmark, and an end-to-end engine smoke test.
+  benchmark, the strategy variants, the walk-forward selection logic, and
+  an end-to-end engine smoke test.
 
 **Not built in this pass** (see `ROADMAP.md`): Kite Connect broker adapter,
 Claude/Anthropic AI Analysis adapter, news ingestion, frontend dashboard,
@@ -76,10 +84,10 @@ credentials are needed for this pass).
 python -m pytest -v
 ```
 
-All 56 tests pass as of this pass. Indicators, strategy, risk engine, profit
-locker, cost model, metrics, screener, and buy-and-hold benchmark are each
-independently unit-tested; the backtest engine also has an end-to-end
-wiring test.
+All 71 tests pass as of this pass. Indicators, strategy, risk engine, profit
+locker, cost model, metrics, screener, buy-and-hold benchmark, strategy
+variants, and walk-forward selection logic are each independently
+unit-tested; the backtest engine also has an end-to-end wiring test.
 
 ## Running a backtest
 
@@ -176,6 +184,93 @@ strategy's return in isolation.
 based on this result.** The full per-symbol and per-basket JSON is saved to
 `reports/basket_backtest_<start>_<end>.json` for further analysis.
 
+**A note on how the 28-symbol basket was chosen:** hand-picked by us, not
+derived from an objective rule (not "all Nifty50", not "all Nifty500 under
+₹X"). ~12 well-known Nifty50 large-caps plus ~16 lower-priced names known
+to be liquid (PSU banks, PSU power/mining, telecom, steel) were picked from
+general market knowledge, without looking up 2019–2024 returns first — but
+several of the PSU names are ones we already knew had a well-publicized
+"PSU re-rating" rally in 2023–2024. So this is hindsight-*adjacent*
+selection, not a blind sample. **The +214% buy-and-hold comparison above is
+likely more flattering than a genuinely unbiased basket would produce** —
+this doesn't change the strategy's own no-edge verdict (that's about the
+strategy's trades relative to itself), but the benchmark number should be
+read with that caveat.
+
+### Strategy variant walk-forward test (TRAIN / VALIDATION / HOLDOUT)
+
+The basket result raised the obvious next question: is there ANY rule-based
+variant that shows a real edge, or is EMA-crossover specifically the
+problem? To test that without just curve-fitting new parameters onto data
+we already know shows no edge, we ran a strict three-way, walk-forward
+comparison:
+
+```bash
+python -m app.cli research
+```
+
+- **TRAIN** (2019-01-01 to 2021-12-31) — free to look at while building.
+- **VALIDATION** (2022-01-01 to 2023-12-31) — every finished variant run
+  against this exactly once; this decides what (if anything) looks
+  promising.
+- **HOLDOUT** (2024-01-01 to 2024-12-31) — touched **at most once**, only
+  for the single variant selected from validation, only after that
+  selection is locked in. The code enforces this structurally: 2024 data
+  is never even fetched during the validation phase, for any variant, and
+  is fetched afterward only for the winner (or never, if nothing clears
+  validation).
+
+The symbol universe was also re-screened using **only** the TRAIN window
+(19 of the 28 candidates passed — one more than the full-history screen's
+18, since SBIN.NS's train-period price/volatility made it affordable then
+even though it wasn't across the whole 2019–2024 average).
+
+Three variants were tested — not a parameter sweep of the baseline's EMA/
+RSI/ATR constants, three distinct hypotheses:
+
+| Variant | Hypothesis |
+|---|---|
+| `baseline_ema_rsi_atr` (reference, unchanged) | Included for comparison only — the existing crossover rules, untouched. |
+| `mean_reversion_support_resistance` | Opposite hypothesis to the baseline: RSI oversold/overbought bounce off rolling support/resistance, for the choppy/range-bound conditions the trend-follower found nothing in. |
+| `regime_gated_trend` | Same EMA/RSI/VWAP entry rules as baseline, but the soft regime gate is hardened to require `classify_regime()` to STRONGLY agree (skip `range_bound` entirely) — tests whether the baseline's logic was diluted by trading in the wrong regime, or is wrong in principle. |
+
+**Results (pooled across all 19 symbols):**
+
+| Variant | Window | Trades | Profit factor | Expectancy (₹) | Expectancy (R) | Passes rule? |
+|---|---|---|---|---|---|---|
+| baseline (reference) | TRAIN | 335 | 0.947 | -0.18 | -0.014 | — |
+| | VALIDATION | 241 | 1.016 | 0.05 | 0.007 | **YES** |
+| mean_reversion | TRAIN | 766 | 1.265 | 1.12 | 0.079 | — |
+| | VALIDATION | 563 | 1.009 | 0.04 | 0.003 | **YES** |
+| regime_gated_trend | TRAIN | 2 | inf | 7.40 | 0.603 | — |
+| | VALIDATION | 0 | — | — | — | no (0 trades) |
+
+`regime_gated_trend`'s strict gate was so restrictive it produced only 2
+trades in three years of TRAIN and **zero** in VALIDATION — the hypothesis
+("was the baseline diluted by wrong-regime trades?") couldn't actually be
+tested at this basket/timeframe; the gate essentially never fires, which
+is itself an honest, if unglamorous, finding.
+
+Two variants technically passed the validation rule — but both by a knife
+edge: profit factors of 1.016 and 1.009, R-expectancies of 0.007 and 0.003.
+That's essentially indistinguishable from noise even before touching
+holdout. The baseline (reference) ranked marginally higher on all three
+metrics, so it was selected and run against HOLDOUT exactly once:
+
+| Window | Trades | Profit factor | Expectancy (₹) | Expectancy (R) |
+|---|---|---|---|---|
+| HOLDOUT (2024) | 122 | 1.05 | 0.11 | **-0.007** |
+
+**It failed.** R-expectancy turned negative on holdout. This is exactly
+the failure mode the three-way split exists to catch: a marginal
+validation "pass" that didn't generalize. Per protocol, `mean_reversion`'s
+holdout was never run (only the selected variant touches holdout).
+
+**Honest verdict: no variant tested in this pass shows a real edge.** Not
+the unchanged baseline, not mean-reversion, not regime-gated trend. Do not
+deploy any of these rule sets live based on this result. Full report:
+`reports/research_walkforward.json`.
+
 ## An honest note on capital size vs. Kite Connect's cost
 
 At ₹1,000 active trading capital, **even a genuinely strong backtested
@@ -199,12 +294,13 @@ app/
   config.py            settings from env vars
   db/                   SQLAlchemy models + session
   features/             indicators.py — EMA/RSI/ATR/VWAP/regime
-  strategy/              signals.py, baseline.py — deterministic strategy
-  risk/                   engine.py, profit_locker.py
-  backtest/                data.py, costs.py, engine.py, metrics.py,
-                            screener.py, benchmark.py, basket.py
-  cli.py                    typer CLI entrypoint
-tests/                       56 tests
-data_cache/                  yfinance CSV cache (gitignored)
-reports/                      backtest JSON reports (gitignored)
+  strategy/               signals.py, baseline.py, variants.py
+  risk/                    engine.py, profit_locker.py
+  backtest/                 data.py, costs.py, engine.py, metrics.py,
+                             screener.py, benchmark.py, basket.py,
+                             research.py
+  cli.py                     typer CLI entrypoint
+tests/                        71 tests
+data_cache/                   yfinance CSV cache (gitignored)
+reports/                       backtest JSON reports (gitignored)
 ```
