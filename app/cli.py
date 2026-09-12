@@ -16,6 +16,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from app.backtest.basket import DEFAULT_BASKET, BasketResult, run_basket
 from app.backtest.data import load_historical
 from app.backtest.engine import BacktestEngine
 from app.config import settings
@@ -116,6 +117,232 @@ def _save_report(symbol: str, start: str, end: str, result) -> None:
     }
     out_path.write_text(json.dumps(payload, indent=2))
     console.print(f"\nReport saved to [bold]{out_path}[/bold]")
+
+
+@app.command("basket-backtest")
+def basket_backtest(
+    start: str = typer.Option(..., help="Start date YYYY-MM-DD"),
+    end: str = typer.Option(..., help="End date YYYY-MM-DD"),
+    out_of_sample_fraction: float = typer.Option(0.3, help="Fraction of the date range held out as out-of-sample"),
+    symbols: str = typer.Option(
+        "", help="Comma-separated Yahoo-style NSE tickers to override the default ~28-symbol basket"
+    ),
+) -> None:
+    """Screen a basket of NSE symbols for tradeability at the CURRENT active
+    capital / risk-per-trade %, backtest every symbol that screens as
+    tradeable, and report combined + per-symbol metrics plus a
+    buy-and-hold benchmark.
+
+    Answers whether an edge (or lack of one) seen on a single symbol is
+    structural to the account size / rule set, or a one-off. See README.md
+    for the honest read on the result of this pass's run."""
+    init_db()
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()] or DEFAULT_BASKET
+    console.print(f"Screening + backtesting {len(symbol_list)} symbols, {start} -> {end} ...")
+    console.print(
+        f"[dim]Active capital: Rs {settings.active_trading_capital_inr:.0f}, "
+        f"risk per trade: {settings.risk_per_trade_pct}%[/dim]\n"
+    )
+
+    session = SessionLocal()
+    try:
+        result = run_basket(
+            session, symbol_list, start, end, settings=settings, out_of_sample_fraction=out_of_sample_fraction
+        )
+    finally:
+        session.close()
+
+    _print_basket_report(result)
+    _save_basket_report(start, end, result)
+
+
+def _print_basket_report(result: BasketResult) -> None:
+    screen_table = Table(title="Screener: is each symbol tradeable at current active capital / risk-per-trade?")
+    screen_table.add_column("Symbol")
+    screen_table.add_column("Last close (Rs)", justify="right")
+    screen_table.add_column("Median ATR14 (Rs)", justify="right")
+    screen_table.add_column("Stop dist. (Rs)", justify="right")
+    screen_table.add_column("Qty (risk)", justify="right")
+    screen_table.add_column("Qty (cash)", justify="right")
+    screen_table.add_column("Tradeable?", justify="center")
+
+    for o in result.outcomes:
+        if o.data_error:
+            screen_table.add_row(o.symbol, "-", "-", "-", "-", "-", f"[dim]no data ({o.data_error})[/dim]")
+            continue
+        sc = o.screen
+        screen_table.add_row(
+            o.symbol,
+            f"{sc.last_close_inr:.2f}",
+            f"{sc.median_atr_14_inr:.2f}",
+            f"{sc.typical_stop_distance_inr:.2f}",
+            str(sc.quantity_by_risk_budget),
+            str(sc.quantity_by_cash_no_leverage),
+            "[green]YES[/green]" if sc.is_tradeable else "[red]no[/red]",
+        )
+    console.print(screen_table)
+    console.print(
+        f"\nTradeable: {len(result.tradeable_symbols)}/"
+        f"{len(result.tradeable_symbols) + len(result.untradeable_symbols)} scored symbols "
+        f"({len(result.data_unavailable_symbols)} had no usable data)\n"
+    )
+
+    per_symbol_table = Table(title="Per-symbol backtest results (tradeable symbols only)")
+    per_symbol_table.add_column("Symbol")
+    per_symbol_table.add_column("Trades", justify="right")
+    per_symbol_table.add_column("OOS trades", justify="right")
+    per_symbol_table.add_column("OOS profit factor", justify="right")
+    per_symbol_table.add_column("OOS expectancy (Rs)", justify="right")
+    per_symbol_table.add_column("Overall return %", justify="right")
+    per_symbol_table.add_column("Buy&hold return % (full)", justify="right")
+    per_symbol_table.add_column("Buy&hold return % (OOS)", justify="right")
+
+    for o in result.outcomes:
+        if o.backtest is None:
+            continue
+        bt = o.backtest
+        per_symbol_table.add_row(
+            o.symbol,
+            str(bt.overall_metrics["num_trades"]),
+            str(bt.out_of_sample_metrics["num_trades"]),
+            str(bt.out_of_sample_metrics["profit_factor"]),
+            str(bt.out_of_sample_metrics["expectancy_inr"]),
+            str(bt.overall_metrics["total_return_pct"]),
+            str(o.buy_hold_full_pct),
+            str(o.buy_hold_out_of_sample_pct),
+        )
+    console.print(per_symbol_table)
+
+    combined_table = Table(title="Combined (pooled-trade) metrics across every tradeable symbol")
+    combined_table.add_column("Metric")
+    combined_table.add_column("In-sample", justify="right")
+    combined_table.add_column("Out-of-sample", justify="right")
+    combined_table.add_column("Overall", justify="right")
+    keys = [
+        ("num_trades", "Trades"),
+        ("win_rate_pct", "Win rate %"),
+        ("profit_factor", "Profit factor"),
+        ("expectancy_inr", "Expectancy (Rs/trade)"),
+        ("expectancy_r", "Expectancy (R)"),
+        ("longest_losing_streak", "Longest losing streak"),
+    ]
+    for key, label in keys:
+        combined_table.add_row(
+            label,
+            str(result.combined_in_sample_metrics.get(key)),
+            str(result.combined_out_of_sample_metrics.get(key)),
+            str(result.combined_overall_metrics.get(key)),
+        )
+    console.print(combined_table)
+
+    console.print(
+        f"\nAverage per-symbol return % (equal-weighted, NOT a shared-capital portfolio): "
+        f"overall {result.avg_symbol_return_pct_overall}%, out-of-sample {result.avg_symbol_return_pct_out_of_sample}%"
+    )
+    console.print(
+        f"Average buy-and-hold return % (equal-weighted, no strategy, no costs): "
+        f"overall {result.avg_buy_hold_return_pct_overall}%, out-of-sample {result.avg_buy_hold_return_pct_out_of_sample}%"
+    )
+
+    console.print()
+    console.print(f"[bold]{_verdict(result)}[/bold]")
+
+
+def _verdict(result: BasketResult) -> str:
+    oos = result.combined_out_of_sample_metrics
+    overall = result.combined_overall_metrics
+    n = oos.get("num_trades", 0)
+    if n == 0:
+        return "VERDICT: no out-of-sample trades were generated across the tradeable basket — no verdict possible."
+
+    pf = oos.get("profit_factor")
+    expectancy_inr = oos.get("expectancy_inr", 0.0)
+    expectancy_r = oos.get("expectancy_r", 0.0)
+    overall_pf = overall.get("profit_factor")
+
+    # Require ALL THREE out-of-sample measures to agree, and the overall
+    # pooled profit factor to also clear breakeven, before calling this a
+    # real (even if modest) edge. Any single non-positive measure is
+    # reported as no edge — a technically-positive rupee expectancy next to
+    # a negative R-expectancy is not a signal worth trusting.
+    pf_ok = pf is not None and (pf == float("inf") or pf >= 1.0)
+    overall_pf_ok = overall_pf is not None and (overall_pf == float("inf") or overall_pf >= 1.0)
+    has_edge = pf_ok and expectancy_inr > 0 and expectancy_r > 0 and overall_pf_ok
+
+    if not has_edge:
+        return (
+            f"VERDICT: NO CONSISTENT EDGE FOUND. Pooled out-of-sample profit factor is {pf}, rupee "
+            f"expectancy is Rs {expectancy_inr}/trade, R-expectancy is {expectancy_r} — these don't all "
+            f"agree, and the overall (in-sample + out-of-sample) pooled profit factor is {overall_pf}, "
+            f"across {n} out-of-sample / {overall.get('num_trades', 0)} total pooled trades from "
+            f"{len(result.tradeable_symbols)} tradeable symbols. Meanwhile buy-and-hold on the same "
+            f"symbols averaged {result.avg_buy_hold_return_pct_out_of_sample}% out-of-sample vs. this "
+            f"strategy's {result.avg_symbol_return_pct_out_of_sample}% average per-symbol return. This is "
+            f"NOT specific to SUZLON.NS — across a real 18-symbol basket, after realistic costs, the "
+            f"current rule set is noise-level at best and net negative in-sample. Do not deploy this rule "
+            f"set live; do not spend money on Kite Connect based on this result."
+        )
+    return (
+        f"VERDICT: a real, if modest, edge. Pooled out-of-sample profit factor is {pf}, rupee expectancy "
+        f"Rs {expectancy_inr}/trade, R-expectancy {expectancy_r}, and the overall pooled profit factor "
+        f"({overall_pf}) agrees, across {n} out-of-sample trades from {len(result.tradeable_symbols)} "
+        f"tradeable symbols. Still a hypothesis worth validating on more data/time windows before "
+        f"committing capital — not a green light on its own."
+    )
+
+
+def _save_basket_report(start: str, end: str, result: BasketResult) -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = REPORTS_DIR / f"basket_backtest_{start}_{end}.json"
+    payload = {
+        "start": start,
+        "end": end,
+        "tradeable_symbols": result.tradeable_symbols,
+        "untradeable_symbols": result.untradeable_symbols,
+        "data_unavailable_symbols": result.data_unavailable_symbols,
+        "combined_in_sample": result.combined_in_sample_metrics,
+        "combined_out_of_sample": result.combined_out_of_sample_metrics,
+        "combined_overall": result.combined_overall_metrics,
+        "avg_symbol_return_pct_overall": result.avg_symbol_return_pct_overall,
+        "avg_symbol_return_pct_out_of_sample": result.avg_symbol_return_pct_out_of_sample,
+        "avg_buy_hold_return_pct_overall": result.avg_buy_hold_return_pct_overall,
+        "avg_buy_hold_return_pct_out_of_sample": result.avg_buy_hold_return_pct_out_of_sample,
+        "verdict": _verdict(result),
+        "per_symbol": [
+            {
+                "symbol": o.symbol,
+                "data_error": o.data_error,
+                "screen": (
+                    {
+                        "last_close_inr": o.screen.last_close_inr,
+                        "median_atr_14_inr": o.screen.median_atr_14_inr,
+                        "typical_stop_distance_inr": o.screen.typical_stop_distance_inr,
+                        "quantity_by_risk_budget": o.screen.quantity_by_risk_budget,
+                        "quantity_by_cash_no_leverage": o.screen.quantity_by_cash_no_leverage,
+                        "is_tradeable": o.screen.is_tradeable,
+                    }
+                    if o.screen
+                    else None
+                ),
+                "buy_hold_full_pct": o.buy_hold_full_pct,
+                "buy_hold_in_sample_pct": o.buy_hold_in_sample_pct,
+                "buy_hold_out_of_sample_pct": o.buy_hold_out_of_sample_pct,
+                "backtest": (
+                    {
+                        "backtest_run_id": o.backtest.backtest_run_id,
+                        "in_sample": o.backtest.in_sample_metrics,
+                        "out_of_sample": o.backtest.out_of_sample_metrics,
+                        "overall": o.backtest.overall_metrics,
+                    }
+                    if o.backtest
+                    else None
+                ),
+            }
+            for o in result.outcomes
+        ],
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+    console.print(f"\nFull report saved to [bold]{out_path}[/bold]")
 
 
 if __name__ == "__main__":

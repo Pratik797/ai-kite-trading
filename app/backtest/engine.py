@@ -62,6 +62,8 @@ class BacktestResult:
     overall_metrics: dict
     split_date: str
     trades: list[Trade] = field(default_factory=list)
+    in_sample_trades: list[Trade] = field(default_factory=list)
+    out_of_sample_trades: list[Trade] = field(default_factory=list)
 
 
 def _as_py_datetime(ts) -> dt.datetime:
@@ -244,6 +246,8 @@ class BacktestEngine:
             overall_metrics=overall_metrics,
             split_date=str(split_ts),
             trades=trades,
+            in_sample_trades=in_sample_trades,
+            out_of_sample_trades=out_of_sample_trades,
         )
 
     def _parameters_snapshot(self, out_of_sample_fraction: float) -> dict:
